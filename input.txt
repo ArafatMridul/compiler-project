@@ -1,0 +1,14 @@
+#=><stdio.h>
+#=><math.h>
+#denote PI 3.14159
+
+num add(num a, num b) {
+    give_back a + b;
+}
+
+Start_From_Here() {
+    num arr[5] <- [1, 3, 5, 7, 9];
+    num idx <- binary_search(arr, 7);
+    console.out("%d\n", idx);
+}
+
