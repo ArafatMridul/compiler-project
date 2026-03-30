@@ -18,6 +18,8 @@ static int indent_level = 0;
 static int syntax_error_count = 0;
 static int semantic_error_count = 0;
 static struct Function *current_function = NULL;
+static char **g_source_lines = NULL;
+static int g_source_line_count = 0;
 
 typedef enum {
     T_INT,
@@ -220,7 +222,13 @@ static Scope *scope_stack = NULL;
 
 static void yyerror(const char *s);
 static void semantic_error(int line, const char *fmt, ...);
+static void semantic_error_at(int line, const char *focus_token, const char *fmt, ...);
 static void syntax_error(int line, const char *fmt, ...);
+static void print_error_context(int line, const char *focus_token);
+static void print_did_you_mean(const char *input, int include_symbols, int include_functions, int include_keywords, int include_types);
+static void load_source_lines(const char *path);
+static void free_source_lines(void);
+static const char *source_line_at(int line);
 static TypeKind type_from_string(const char *name);
 static const char *type_name(TypeKind type);
 static int is_numeric(TypeKind type);
@@ -282,6 +290,7 @@ static void emit_expr(FILE *f, Expr *expr);
 static void emit_params(FILE *f, Param *params);
 static int includes_contains(const char *header);
 static void emit_binary_search_helper(FILE *f);
+static void emit_array_helpers(FILE *f);
 static int stmt_list_needs_switch_break(Stmt *stmt);
 %}
 %define parse.error detailed
@@ -434,7 +443,8 @@ stmt
             }
         | IDENT IDENT opt_init ';'
             {
-                    semantic_error(line_no, "unknown type '%s'", $1);
+                    semantic_error_at(line_no, $1, "unknown type '%s'", $1);
+                    print_did_you_mean($1, 0, 0, 0, 1);
                     $$ = NULL;
             }
     | IDENT ASSIGN expr ';'
@@ -783,6 +793,201 @@ type
 
 %%
 
+static const char *k_language_keywords[] = {
+    "Start_From_Here",
+    "IF", "ELIF", "ELSE", "THEN",
+    "FOR", "until_false", "snap", "next_iter",
+    "give_back", "console.out",
+    "#=>", "#denote",
+    "BOTH", "EITHER", "NEGATE",
+    "CHOOSE", "WHEN", "BASE_CHOICE"
+};
+
+static const char *k_language_types[] = {
+    "num", "fnum", "dnum", "lonum", "ch", "bol", "empty",
+    "int", "float", "double", "long", "char", "bool", "void"
+};
+
+static const char *k_builtin_functions[] = {
+    "binary_search",
+    "sort", "find", "map", "filter", "reduce",
+    "raise_to", "square_root", "magnitude", "round_down", "round_up", "ln",
+    "SIN", "COS", "TAN"
+};
+
+static int min3(int a, int b, int c) {
+    int m = a < b ? a : b;
+    return m < c ? m : c;
+}
+
+static int edit_distance_ci(const char *a, const char *b, int max_dist) {
+    if (!a || !b) return max_dist + 1;
+    size_t n = strlen(a);
+    size_t m = strlen(b);
+    size_t diff = n > m ? n - m : m - n;
+    if ((int)diff > max_dist) return max_dist + 1;
+
+    int *prev = malloc((m + 1) * sizeof(int));
+    int *curr = malloc((m + 1) * sizeof(int));
+    if (!prev || !curr) {
+        free(prev);
+        free(curr);
+        return max_dist + 1;
+    }
+
+    for (size_t j = 0; j <= m; j++) prev[j] = (int)j;
+
+    for (size_t i = 1; i <= n; i++) {
+        curr[0] = (int)i;
+        int row_min = curr[0];
+        for (size_t j = 1; j <= m; j++) {
+            int cost = tolower((unsigned char)a[i - 1]) == tolower((unsigned char)b[j - 1]) ? 0 : 1;
+            curr[j] = min3(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost);
+            if (curr[j] < row_min) row_min = curr[j];
+        }
+        if (row_min > max_dist) {
+            free(prev);
+            free(curr);
+            return max_dist + 1;
+        }
+        int *tmp = prev;
+        prev = curr;
+        curr = tmp;
+    }
+
+    int dist = prev[m];
+    free(prev);
+    free(curr);
+    return dist;
+}
+
+static void consider_candidate(const char *input, const char *candidate, const char **best, int *best_dist) {
+    if (!input || !candidate || !best || !best_dist) return;
+    if (strcmp(input, candidate) == 0) return;
+    int dist = edit_distance_ci(input, candidate, 3);
+    if (dist < *best_dist) {
+        *best = candidate;
+        *best_dist = dist;
+    }
+}
+
+static const char *source_line_at(int line) {
+    if (line <= 0 || line > g_source_line_count || !g_source_lines) return NULL;
+    return g_source_lines[line - 1];
+}
+
+static void print_error_context(int line, const char *focus_token) {
+    const char *src = source_line_at(line);
+    if ((!src || src[0] == '\0') && current_line_text[0] != '\0') {
+        src = current_line_text;
+    }
+    if (!src || src[0] == '\0') return;
+
+    fprintf(stderr, "  %s\n", src);
+    fprintf(stderr, "  ");
+
+    int col = 0;
+    if (focus_token && focus_token[0] != '\0') {
+        const char *pos = strstr(src, focus_token);
+        if (pos) col = (int)(pos - src);
+    }
+
+    for (int i = 0; i < col; i++) {
+        fputc(src[i] == '\t' ? '\t' : ' ', stderr);
+    }
+    fputc('^', stderr);
+
+    if (focus_token && focus_token[0] != '\0') {
+        size_t n = strlen(focus_token);
+        for (size_t i = 1; i < n; i++) {
+            fputc('~', stderr);
+        }
+    }
+    fputc('\n', stderr);
+}
+
+static void print_did_you_mean(const char *input, int include_symbols, int include_functions, int include_keywords, int include_types) {
+    const char *best = NULL;
+    int best_dist = 4;
+    if (!input || !input[0]) return;
+
+    if (include_keywords) {
+        size_t n = sizeof(k_language_keywords) / sizeof(k_language_keywords[0]);
+        for (size_t i = 0; i < n; i++) {
+            consider_candidate(input, k_language_keywords[i], &best, &best_dist);
+        }
+    }
+
+    if (include_types) {
+        size_t n = sizeof(k_language_types) / sizeof(k_language_types[0]);
+        for (size_t i = 0; i < n; i++) {
+            consider_candidate(input, k_language_types[i], &best, &best_dist);
+        }
+    }
+
+    if (include_functions) {
+        size_t n = sizeof(k_builtin_functions) / sizeof(k_builtin_functions[0]);
+        for (size_t i = 0; i < n; i++) {
+            consider_candidate(input, k_builtin_functions[i], &best, &best_dist);
+        }
+        for (Function *fn = g_functions; fn; fn = fn->next) {
+            consider_candidate(input, fn->name, &best, &best_dist);
+        }
+        if (g_main_fn) {
+            consider_candidate(input, g_main_fn->name, &best, &best_dist);
+        }
+    }
+
+    if (include_symbols) {
+        for (Scope *scope = scope_stack; scope; scope = scope->parent) {
+            for (Symbol *sym = scope->symbols; sym; sym = sym->next) {
+                consider_candidate(input, sym->name, &best, &best_dist);
+            }
+        }
+    }
+
+    if (best) {
+        fprintf(stderr, "  hint: did you mean '%s'?\n", best);
+    }
+}
+
+static void load_source_lines(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+
+    char buf[4096];
+    while (fgets(buf, sizeof(buf), f)) {
+        size_t len = strlen(buf);
+        while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r')) {
+            buf[--len] = '\0';
+        }
+        char **next = realloc(g_source_lines, (g_source_line_count + 1) * sizeof(*g_source_lines));
+        if (!next) {
+            fclose(f);
+            return;
+        }
+        g_source_lines = next;
+        g_source_lines[g_source_line_count] = strdup(buf);
+        if (!g_source_lines[g_source_line_count]) {
+            fclose(f);
+            return;
+        }
+        g_source_line_count++;
+    }
+
+    fclose(f);
+}
+
+static void free_source_lines(void) {
+    if (!g_source_lines) return;
+    for (int i = 0; i < g_source_line_count; i++) {
+        free(g_source_lines[i]);
+    }
+    free(g_source_lines);
+    g_source_lines = NULL;
+    g_source_line_count = 0;
+}
+
 static void syntax_error(int line, const char *fmt, ...) {
     va_list ap;
     syntax_error_count++;
@@ -791,6 +996,7 @@ static void syntax_error(int line, const char *fmt, ...) {
     vfprintf(stderr, fmt, ap);
     va_end(ap);
     fputc('\n', stderr);
+    print_error_context(line, (line == last_token_line) ? last_token_text : NULL);
 }
 
 static void semantic_error(int line, const char *fmt, ...) {
@@ -800,6 +1006,18 @@ static void semantic_error(int line, const char *fmt, ...) {
     vfprintf(stderr, fmt, ap);
     va_end(ap);
     fputc('\n', stderr);
+    print_error_context(line, (line == last_token_line) ? last_token_text : NULL);
+    semantic_error_count++;
+}
+
+static void semantic_error_at(int line, const char *focus_token, const char *fmt, ...) {
+    va_list ap;
+    fprintf(stderr, "Semantic error on line %d: ", line);
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+    print_error_context(line, focus_token);
     semantic_error_count++;
 }
 
@@ -810,9 +1028,9 @@ static void yyerror(const char *s) {
     } else {
         fprintf(stderr, "Syntax error on line %d: %s\n", line_no, s);
     }
-
-    if (current_line_text[0] != '\0') {
-        fprintf(stderr, "  %s\n", current_line_text);
+    print_error_context(last_token_line > 0 ? last_token_line : line_no, last_token_text);
+    if (isalpha((unsigned char)last_token_text[0]) || last_token_text[0] == '_') {
+        print_did_you_mean(last_token_text, 1, 1, 1, 1);
     }
 }
 
@@ -1290,7 +1508,8 @@ static TypeKind infer_expr(Expr *expr) {
         case EXPR_IDENT: {
             Symbol *sym = lookup_symbol(expr->text);
             if (!sym) {
-                semantic_error(expr->line, "undeclared identifier '%s'", expr->text);
+                semantic_error_at(expr->line, expr->text, "undeclared identifier '%s'", expr->text);
+                print_did_you_mean(expr->text, 1, 1, 1, 0);
                 expr->inferred = T_ERROR;
             } else {
                 expr->is_array = sym->is_array;
@@ -1307,7 +1526,8 @@ static TypeKind infer_expr(Expr *expr) {
         case EXPR_INDEX: {
             Symbol *sym = lookup_symbol(expr->text);
             if (!sym) {
-                semantic_error(expr->line, "undeclared array '%s'", expr->text);
+                semantic_error_at(expr->line, expr->text, "undeclared array '%s'", expr->text);
+                print_did_you_mean(expr->text, 1, 0, 0, 0);
                 expr->inferred = T_ERROR;
                 break;
             }
@@ -1352,7 +1572,8 @@ static TypeKind infer_expr(Expr *expr) {
                 }
                 Symbol *arr_sym = lookup_symbol(array_expr->text);
                 if (!arr_sym) {
-                    semantic_error(expr->line, "undeclared array '%s'", array_expr->text);
+                    semantic_error_at(expr->line, array_expr->text, "undeclared array '%s'", array_expr->text);
+                    print_did_you_mean(array_expr->text, 1, 0, 0, 0);
                     expr->inferred = T_ERROR;
                     break;
                 }
@@ -1371,6 +1592,167 @@ static TypeKind infer_expr(Expr *expr) {
                 }
                 expr->inferred = T_INT;
                 break;
+            }
+            if (strcmp(expr->text, "sort") == 0 ||
+                strcmp(expr->text, "find") == 0 ||
+                strcmp(expr->text, "map") == 0 ||
+                strcmp(expr->text, "filter") == 0 ||
+                strcmp(expr->text, "reduce") == 0) {
+                int argc = count_args(expr->args);
+                ExprList *first = expr->args;
+                Expr *array_expr = first ? first->expr : NULL;
+
+                if (!array_expr || array_expr->kind != EXPR_IDENT) {
+                    semantic_error(expr->line, "%s first argument must be an array name", expr->text);
+                    expr->inferred = T_ERROR;
+                    break;
+                }
+
+                Symbol *arr_sym = lookup_symbol(array_expr->text);
+                if (!arr_sym) {
+                    semantic_error_at(expr->line, array_expr->text, "undeclared array '%s'", array_expr->text);
+                    print_did_you_mean(array_expr->text, 1, 0, 0, 0);
+                    expr->inferred = T_ERROR;
+                    break;
+                }
+                if (!arr_sym->is_array) {
+                    semantic_error(expr->line, "%s expects an array as first argument, got '%s'", expr->text, array_expr->text);
+                    expr->inferred = T_ERROR;
+                    break;
+                }
+                if (arr_sym->type != T_INT) {
+                    semantic_error(expr->line, "%s currently supports only int arrays", expr->text);
+                }
+
+                expr->array_size = arr_sym->array_size;
+
+                if (strcmp(expr->text, "sort") == 0) {
+                    if (argc != 1) {
+                        semantic_error(expr->line, "sort expects 1 argument: array");
+                        expr->inferred = T_ERROR;
+                        break;
+                    }
+                    expr->inferred = T_VOID;
+                    break;
+                }
+
+                if (strcmp(expr->text, "find") == 0) {
+                    if (argc != 2) {
+                        semantic_error(expr->line, "find expects 2 arguments: array and target value");
+                        expr->inferred = T_ERROR;
+                        break;
+                    }
+                    ExprList *second = first->next;
+                    TypeKind target_type = infer_expr(second ? second->expr : NULL);
+                    if (!is_numeric(target_type)) {
+                        semantic_error(expr->line, "find target must be numeric");
+                    }
+                    expr->inferred = T_INT;
+                    break;
+                }
+
+                if (strcmp(expr->text, "map") == 0) {
+                    if (argc != 2) {
+                        semantic_error(expr->line, "map expects 2 arguments: array and unary function");
+                        expr->inferred = T_ERROR;
+                        break;
+                    }
+                    ExprList *second = first->next;
+                    Expr *fn_expr = second ? second->expr : NULL;
+                    if (!fn_expr || fn_expr->kind != EXPR_IDENT) {
+                        semantic_error(expr->line, "map second argument must be a function name");
+                        expr->inferred = T_ERROR;
+                        break;
+                    }
+                    Function *fn = find_function(fn_expr->text);
+                    if (!fn) {
+                        semantic_error_at(expr->line, fn_expr->text, "call to undefined function '%s'", fn_expr->text);
+                        print_did_you_mean(fn_expr->text, 0, 1, 0, 0);
+                        expr->inferred = T_ERROR;
+                        break;
+                    }
+                    if (count_params(fn->params) != 1) {
+                        semantic_error(expr->line, "map callback '%s' must accept exactly 1 parameter", fn->name);
+                    } else {
+                        Param *p = fn->params;
+                        if (!is_numeric(p->type) || !is_numeric(fn->return_type)) {
+                            semantic_error(expr->line, "map callback '%s' must be numeric -> numeric", fn->name);
+                        }
+                    }
+                    expr->inferred = T_VOID;
+                    break;
+                }
+
+                if (strcmp(expr->text, "filter") == 0) {
+                    if (argc != 2) {
+                        semantic_error(expr->line, "filter expects 2 arguments: array and predicate function");
+                        expr->inferred = T_ERROR;
+                        break;
+                    }
+                    ExprList *second = first->next;
+                    Expr *fn_expr = second ? second->expr : NULL;
+                    if (!fn_expr || fn_expr->kind != EXPR_IDENT) {
+                        semantic_error(expr->line, "filter second argument must be a function name");
+                        expr->inferred = T_ERROR;
+                        break;
+                    }
+                    Function *fn = find_function(fn_expr->text);
+                    if (!fn) {
+                        semantic_error_at(expr->line, fn_expr->text, "call to undefined function '%s'", fn_expr->text);
+                        print_did_you_mean(fn_expr->text, 0, 1, 0, 0);
+                        expr->inferred = T_ERROR;
+                        break;
+                    }
+                    if (count_params(fn->params) != 1) {
+                        semantic_error(expr->line, "filter callback '%s' must accept exactly 1 parameter", fn->name);
+                    } else {
+                        Param *p = fn->params;
+                        if (!is_numeric(p->type) || !is_bool_like(fn->return_type)) {
+                            semantic_error(expr->line, "filter callback '%s' must be numeric -> bool-like", fn->name);
+                        }
+                    }
+                    expr->inferred = T_INT;
+                    break;
+                }
+
+                if (strcmp(expr->text, "reduce") == 0) {
+                    if (argc != 3) {
+                        semantic_error(expr->line, "reduce expects 3 arguments: array, binary function, initial value");
+                        expr->inferred = T_ERROR;
+                        break;
+                    }
+                    ExprList *second = first->next;
+                    ExprList *third = second ? second->next : NULL;
+                    Expr *fn_expr = second ? second->expr : NULL;
+                    Expr *init_expr = third ? third->expr : NULL;
+                    if (!fn_expr || fn_expr->kind != EXPR_IDENT) {
+                        semantic_error(expr->line, "reduce second argument must be a function name");
+                        expr->inferred = T_ERROR;
+                        break;
+                    }
+                    Function *fn = find_function(fn_expr->text);
+                    if (!fn) {
+                        semantic_error_at(expr->line, fn_expr->text, "call to undefined function '%s'", fn_expr->text);
+                        print_did_you_mean(fn_expr->text, 0, 1, 0, 0);
+                        expr->inferred = T_ERROR;
+                        break;
+                    }
+                    if (count_params(fn->params) != 2) {
+                        semantic_error(expr->line, "reduce callback '%s' must accept exactly 2 parameters", fn->name);
+                    } else {
+                        Param *p1 = fn->params;
+                        Param *p2 = p1 ? p1->next : NULL;
+                        if (!is_numeric(p1->type) || !is_numeric(p2 ? p2->type : T_ERROR) || !is_numeric(fn->return_type)) {
+                            semantic_error(expr->line, "reduce callback '%s' must be (numeric, numeric) -> numeric", fn->name);
+                        }
+                    }
+                    TypeKind init_type = infer_expr(init_expr);
+                    if (!is_numeric(init_type)) {
+                        semantic_error(expr->line, "reduce initial value must be numeric");
+                    }
+                    expr->inferred = T_INT;
+                    break;
+                }
             }
             /* Built-in math-like helpers from the custom language */
             if (strcmp(expr->text, "raise_to") == 0 ||
@@ -1393,7 +1775,8 @@ static TypeKind infer_expr(Expr *expr) {
             }
             Function *fn = find_function(expr->text);
             if (!fn) {
-                semantic_error(expr->line, "call to undefined function '%s'", expr->text);
+                semantic_error_at(expr->line, expr->text, "call to undefined function '%s'", expr->text);
+                print_did_you_mean(expr->text, 0, 1, 0, 0);
                 expr->inferred = T_ERROR;
                 break;
             }
@@ -1548,7 +1931,8 @@ static void analyze_stmt(Stmt *stmt) {
         case STMT_ASSIGN: {
             Symbol *sym = lookup_symbol(stmt->u.assign.name);
             if (!sym) {
-                semantic_error(stmt->line, "assignment to undeclared variable '%s'", stmt->u.assign.name);
+                semantic_error_at(stmt->line, stmt->u.assign.name, "assignment to undeclared variable '%s'", stmt->u.assign.name);
+                print_did_you_mean(stmt->u.assign.name, 1, 0, 0, 0);
                 break;
             }
             TypeKind value_type = infer_expr(stmt->u.assign.value);
@@ -1564,7 +1948,8 @@ static void analyze_stmt(Stmt *stmt) {
         case STMT_INDEX_ASSIGN: {
             Symbol *sym = lookup_symbol(stmt->u.index_assign.name);
             if (!sym) {
-                semantic_error(stmt->line, "assignment to undeclared array '%s'", stmt->u.index_assign.name);
+                semantic_error_at(stmt->line, stmt->u.index_assign.name, "assignment to undeclared array '%s'", stmt->u.index_assign.name);
+                print_did_you_mean(stmt->u.index_assign.name, 1, 0, 0, 0);
                 break;
             }
             if (!sym->is_array) {
@@ -1805,6 +2190,77 @@ static void emit_expr_prec(FILE *f, Expr *expr, int parent_prec) {
                     fputs(", 0, ", f);
                 }
                 emit_expr_prec(f, second ? second->expr : NULL, 0);
+                fputc(')', f);
+                break;
+            }
+            if (strcmp(expr->text, "sort") == 0) {
+                ExprList *first = expr->args;
+                fprintf(f, "array_sort_int(");
+                emit_expr_prec(f, first ? first->expr : NULL, 0);
+                if (expr->array_size > 0) {
+                    fprintf(f, ", %d", expr->array_size);
+                } else {
+                    fputs(", 0", f);
+                }
+                fputc(')', f);
+                break;
+            }
+            if (strcmp(expr->text, "find") == 0) {
+                ExprList *first = expr->args;
+                ExprList *second = first ? first->next : NULL;
+                fprintf(f, "array_find_int(");
+                emit_expr_prec(f, first ? first->expr : NULL, 0);
+                if (expr->array_size > 0) {
+                    fprintf(f, ", %d, ", expr->array_size);
+                } else {
+                    fputs(", 0, ", f);
+                }
+                emit_expr_prec(f, second ? second->expr : NULL, 0);
+                fputc(')', f);
+                break;
+            }
+            if (strcmp(expr->text, "map") == 0) {
+                ExprList *first = expr->args;
+                ExprList *second = first ? first->next : NULL;
+                fprintf(f, "array_map_int(");
+                emit_expr_prec(f, first ? first->expr : NULL, 0);
+                if (expr->array_size > 0) {
+                    fprintf(f, ", %d, ", expr->array_size);
+                } else {
+                    fputs(", 0, ", f);
+                }
+                emit_expr_prec(f, second ? second->expr : NULL, 0);
+                fputc(')', f);
+                break;
+            }
+            if (strcmp(expr->text, "filter") == 0) {
+                ExprList *first = expr->args;
+                ExprList *second = first ? first->next : NULL;
+                fprintf(f, "array_filter_int(");
+                emit_expr_prec(f, first ? first->expr : NULL, 0);
+                if (expr->array_size > 0) {
+                    fprintf(f, ", %d, ", expr->array_size);
+                } else {
+                    fputs(", 0, ", f);
+                }
+                emit_expr_prec(f, second ? second->expr : NULL, 0);
+                fputc(')', f);
+                break;
+            }
+            if (strcmp(expr->text, "reduce") == 0) {
+                ExprList *first = expr->args;
+                ExprList *second = first ? first->next : NULL;
+                ExprList *third = second ? second->next : NULL;
+                fprintf(f, "array_reduce_int(");
+                emit_expr_prec(f, first ? first->expr : NULL, 0);
+                if (expr->array_size > 0) {
+                    fprintf(f, ", %d, ", expr->array_size);
+                } else {
+                    fputs(", 0, ", f);
+                }
+                emit_expr_prec(f, second ? second->expr : NULL, 0);
+                fputs(", ", f);
+                emit_expr_prec(f, third ? third->expr : NULL, 0);
                 fputc(')', f);
                 break;
             }
@@ -2067,6 +2523,51 @@ static void emit_binary_search_helper(FILE *f) {
     fputs("}\n\n", f);
 }
 
+static void emit_array_helpers(FILE *f) {
+    fputs("static void array_sort_int(int arr[], int n) {\n", f);
+    fputs("    for (int i = 0; i < n; i++) {\n", f);
+    fputs("        for (int j = 0; j + 1 < n - i; j++) {\n", f);
+    fputs("            if (arr[j] > arr[j + 1]) {\n", f);
+    fputs("                int t = arr[j];\n", f);
+    fputs("                arr[j] = arr[j + 1];\n", f);
+    fputs("                arr[j + 1] = t;\n", f);
+    fputs("            }\n", f);
+    fputs("        }\n", f);
+    fputs("    }\n", f);
+    fputs("}\n\n", f);
+
+    fputs("static int array_find_int(int arr[], int n, int target) {\n", f);
+    fputs("    for (int i = 0; i < n; i++) {\n", f);
+    fputs("        if (arr[i] == target) return i;\n", f);
+    fputs("    }\n", f);
+    fputs("    return -1;\n", f);
+    fputs("}\n\n", f);
+
+    fputs("static void array_map_int(int arr[], int n, int (*op)(int)) {\n", f);
+    fputs("    for (int i = 0; i < n; i++) {\n", f);
+    fputs("        arr[i] = op(arr[i]);\n", f);
+    fputs("    }\n", f);
+    fputs("}\n\n", f);
+
+    fputs("static int array_filter_int(int arr[], int n, int (*pred)(int)) {\n", f);
+    fputs("    int write_idx = 0;\n", f);
+    fputs("    for (int i = 0; i < n; i++) {\n", f);
+    fputs("        if (pred(arr[i])) {\n", f);
+    fputs("            arr[write_idx++] = arr[i];\n", f);
+    fputs("        }\n", f);
+    fputs("    }\n", f);
+    fputs("    return write_idx;\n", f);
+    fputs("}\n\n", f);
+
+    fputs("static int array_reduce_int(int arr[], int n, int (*op)(int, int), int init) {\n", f);
+    fputs("    int acc = init;\n", f);
+    fputs("    for (int i = 0; i < n; i++) {\n", f);
+    fputs("        acc = op(acc, arr[i]);\n", f);
+    fputs("    }\n", f);
+    fputs("    return acc;\n", f);
+    fputs("}\n\n", f);
+}
+
 static void emit_program(const char *path) {
     outf = fopen(path, "w");
     if (!outf) {
@@ -2079,6 +2580,7 @@ static void emit_program(const char *path) {
     emit_include(outf, "<stdlib.h>");
     emit_include(outf, "<stdbool.h>");
     emit_binary_search_helper(outf);
+    emit_array_helpers(outf);
     for (Include *inc = g_includes; inc; inc = inc->next) {
         if (strcmp(inc->header, "<stdio.h>") == 0 || strcmp(inc->header, "<math.h>") == 0 || strcmp(inc->header, "<stdbool.h>") == 0) {
             continue;
@@ -2123,9 +2625,12 @@ int main(int argc, char **argv) {
     const char *input_path = (argc > 1) ? argv[1] : "input.txt";
     const char *output_path = (argc > 2) ? argv[2] : "output.c";
 
+    load_source_lines(input_path);
+
     FILE *infile = fopen(input_path, "r");
     if (!infile) {
         fprintf(stderr, "Error: cannot open %s\n", input_path);
+        free_source_lines();
         return 1;
     }
 
@@ -2137,9 +2642,11 @@ int main(int argc, char **argv) {
     analyze_program();
 
     if (semantic_error_count > 0 || syntax_error_count > 0) {
+        free_source_lines();
         return 1;
     }
 
     emit_program(output_path);
+    free_source_lines();
     return 0;
 }

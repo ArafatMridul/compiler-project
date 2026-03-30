@@ -1,0 +1,26 @@
+#=><stdio.h>
+
+num add(num a, num b) {
+    give_back a + b;
+}
+
+num square(num x) {
+    give_back x * x;
+}
+
+num is_even(num x) {
+    give_back 1 - (x % 2);
+}
+
+Start_From_Here() {
+    num arr[6] <- [5, 2, 9, 1, 4, 6];
+
+    sort(arr);
+    num idx <- find(arr, 4);
+
+    map(arr, square);
+    num sum <- reduce(arr, add, 0);
+    num kept <- filter(arr, is_even);
+
+    console.out("idx=%d sum=%d kept=%d first=%d\n", idx, sum, kept, arr[0]);
+}
