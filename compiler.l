@@ -79,14 +79,20 @@ STRING      \"[^\"\n]*\"
 "next_iter"           { append_text(yytext); record_token(yytext); return CONTINUE_KW; }
 "give_back"           { append_text(yytext); record_token(yytext); return RETURN; }
 "console.out"         { append_text(yytext); record_token(yytext); return PRINT; }
+"choose"              { append_text(yytext); record_token(yytext); return CHOOSE; }
+"when"                { append_text(yytext); record_token(yytext); return WHEN; }
+"base_choice"         { append_text(yytext); record_token(yytext); return BASE_CHOICE; }
 
 "<-"                  { append_text(yytext); record_token(yytext); return ASSIGN; }
+"="                   { append_text(yytext); record_token(yytext); return ASSIGN; }
 "BOTH"                { append_text(yytext); record_token(yytext); return AND; }
 "EITHER"              { append_text(yytext); record_token(yytext); return OR; }
 "NEGATE"              { append_text(yytext); record_token(yytext); return NOT; }
 
 "<=="                 { append_text(yytext); record_token(yytext); return LE; }
+"<="                  { append_text(yytext); record_token(yytext); return LE; }
 ">=="                 { append_text(yytext); record_token(yytext); return GE; }
+">="                  { append_text(yytext); record_token(yytext); return GE; }
 "!=="                 { append_text(yytext); record_token(yytext); return NE; }
 "=="                  { append_text(yytext); record_token(yytext); return EQ; }
 

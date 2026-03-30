@@ -66,7 +66,8 @@ typedef enum {
     STMT_BLOCK,
     STMT_IF,
     STMT_WHILE,
-    STMT_FOR
+    STMT_FOR,
+    STMT_SWITCH
 } StmtKind;
 
 struct Expr {
@@ -151,7 +152,16 @@ struct Stmt {
             Expr *cond;
             Expr *post;
             Stmt *body;
+            int has_init_decl;
+            TypeKind init_decl_type;
+            char *init_decl_name;
+            Expr *init_decl_value;
         } for_stmt;
+        struct {
+            Expr *expr;
+            Branch *cases;
+            Stmt *default_branch;
+        } switch_stmt;
     } u;
 };
 
@@ -242,6 +252,7 @@ static Stmt *make_block_stmt(Stmt *stmts, int line);
 static Stmt *make_if_stmt(Expr *cond, Stmt *then_branch, Branch *elifs, Stmt *else_branch, int line);
 static Stmt *make_while_stmt(Expr *cond, Stmt *body, int line);
 static Stmt *make_for_stmt(Expr *init, Expr *cond, Expr *post, Stmt *body, int line);
+static Stmt *make_switch_stmt(Expr *expr, Branch *cases, Stmt *default_branch, int line);
 static Stmt *make_break_stmt(int line);
 static Stmt *make_continue_stmt(int line);
 static Function *function_new(char *name, const char *return_type_name, Param *params, Stmt *body, int line, int is_main);
@@ -264,12 +275,14 @@ static TypeKind infer_expr(Expr *expr);
 static void emit_program(const char *path);
 static void emit_include(FILE *f, const char *header);
 static void emit_indent(FILE *f);
+static void emit_expr_prec(FILE *f, Expr *expr, int parent_prec);
 static void emit_stmt_list(FILE *f, Stmt *stmt);
 static void emit_stmt(FILE *f, Stmt *stmt);
 static void emit_expr(FILE *f, Expr *expr);
 static void emit_params(FILE *f, Param *params);
 static int includes_contains(const char *header);
 static void emit_binary_search_helper(FILE *f);
+static int stmt_list_needs_switch_break(Stmt *stmt);
 %}
 %define parse.error detailed
 %union {
@@ -281,6 +294,7 @@ static void emit_binary_search_helper(FILE *f);
 %token INCLUDE DEFINE MAIN
 %token TYPE_INT TYPE_FLOAT TYPE_DOUBLE TYPE_LONG TYPE_CHAR TYPE_BOOL TYPE_VOID
 %token RETURN PRINT IF ELIF ELSE THEN FOR WHILE_KW BREAK_KW CONTINUE_KW
+%token CHOOSE WHEN BASE_CHOICE
 %token ASSIGN AND OR NOT LE GE EQ NE
 
 %type <str> type
@@ -289,6 +303,8 @@ static void emit_binary_search_helper(FILE *f);
 %type <ptr> param param_list_opt param_list
 %type <ptr> stmt stmt_list block function_def main_block if_stmt while_stmt for_stmt
 %type <ptr> if_tail
+%type <ptr> switch_stmt switch_tail
+%type <ptr> extra_stmts_opt extra_stmt_list
 
 %left OR
 %left AND
@@ -303,10 +319,13 @@ static void emit_binary_search_helper(FILE *f);
 %%
 
 program
-    : top_items main_block
+    : top_items main_block extra_stmts_opt
       {
           if (!g_main_fn) {
               syntax_error(line_no, "missing Start_From_Here() block");
+          }
+          if ($3) {
+              g_main_fn->body = stmt_append(g_main_fn->body, (Stmt *)$3);
           }
       }
     ;
@@ -316,25 +335,54 @@ top_items
     | /* empty */
     ;
 
+extra_stmts_opt
+        : /* empty */
+            {
+                    $$ = NULL;
+            }
+        | extra_stmt_list
+            {
+                    $$ = $1;
+            }
+        ;
+
+extra_stmt_list
+        : extra_stmt_list stmt
+            {
+                    $$ = stmt_append($1, $2);
+            }
+        | stmt
+            {
+                    $$ = $1;
+            }
+        ;
+
 top_item
-    : INCLUDE HEADER
-      {
-          add_include($2, line_no);
-      }
-    | DEFINE IDENT expr
-      {
-          add_define($2, $3, line_no);
-      }
-    | function_def
-    ;
+        : INCLUDE HEADER
+            {
+                    add_include($2, line_no);
+            }
+        | DEFINE IDENT expr
+            {
+                    add_define($2, $3, line_no);
+            }
+        | function_def
+        ;
 
 function_def
-    : type IDENT '(' param_list_opt ')' block
-      {
-          add_function(function_new($2, $1, $4, $6, line_no, 0));
-          $$ = NULL;
-      }
-    ;
+        /* Original C-style: return_type name(params) { ... } */
+        : type IDENT '(' param_list_opt ')' block
+            {
+                    add_function(function_new($2, $1, $4, $6, line_no, 0));
+                    $$ = NULL;
+            }
+        /* New custom style: name(params): return_type => { ... } */
+        | IDENT '(' param_list_opt ')' ':' type ASSIGN '>' block
+            {
+              add_function(function_new($1, $6, $3, $9, line_no, 0));
+                    $$ = NULL;
+            }
+        ;
 
 main_block
     : MAIN '(' ')' block
@@ -420,6 +468,7 @@ stmt
     | if_stmt
     | while_stmt
     | for_stmt
+        | switch_stmt
     | block
       {
           $$ = make_block_stmt($1, line_no);
@@ -436,12 +485,17 @@ stmt
     ;
 
 if_stmt
-    : IF expr THEN block if_tail
-      {
-                    IfTail *tail = (IfTail *)$5;
-                    $$ = make_if_stmt($2, $4, tail->elifs, tail->else_branch, line_no);
-      }
-    ;
+        : IF expr block if_tail
+            {
+                                        IfTail *tail = (IfTail *)$4;
+                                        $$ = make_if_stmt($2, $3, tail->elifs, tail->else_branch, line_no);
+            }
+        | IF expr THEN block if_tail
+            {
+                                        IfTail *tail = (IfTail *)$5;
+                                        $$ = make_if_stmt($2, $4, tail->elifs, tail->else_branch, line_no);
+            }
+        ;
 
 if_tail
     : /* empty */
@@ -455,10 +509,10 @@ if_tail
           tail->else_branch = NULL;
           $$ = tail;
       }
-    | ELIF expr THEN block if_tail
+    | ELIF expr block if_tail
       {
-          Branch *node = branch_new($2, $4, line_no);
-          IfTail *tail = (IfTail *)$5;
+          Branch *node = branch_new($2, $3, line_no);
+          IfTail *tail = (IfTail *)$4;
           node->next = tail->elifs;
           IfTail *out = malloc(sizeof(IfTail));
           if (!out) {
@@ -482,6 +536,53 @@ if_tail
       }
     ;
 
+switch_stmt
+        : CHOOSE '(' expr ')' '{' switch_tail '}'
+            {
+                    IfTail *tail = (IfTail *)$6;
+                    $$ = make_switch_stmt($3, tail->elifs, tail->else_branch, line_no);
+            }
+        ;
+
+switch_tail
+        : /* empty */
+            {
+                    IfTail *tail = malloc(sizeof(IfTail));
+                    if (!tail) {
+                            fprintf(stderr, "Out of memory\n");
+                            exit(1);
+                    }
+                    tail->elifs = NULL;
+                    tail->else_branch = NULL;
+                    $$ = tail;
+            }
+        | WHEN expr ':' block switch_tail
+            {
+                    Branch *node = branch_new($2, $4, line_no);
+                    IfTail *tail = (IfTail *)$5;
+                    node->next = tail->elifs;
+                    IfTail *out = malloc(sizeof(IfTail));
+                    if (!out) {
+                            fprintf(stderr, "Out of memory\n");
+                            exit(1);
+                    }
+                    out->elifs = node;
+                    out->else_branch = tail->else_branch;
+                    $$ = out;
+            }
+        | BASE_CHOICE ':' block
+            {
+                    IfTail *out = malloc(sizeof(IfTail));
+                    if (!out) {
+                            fprintf(stderr, "Out of memory\n");
+                            exit(1);
+                    }
+                    out->elifs = NULL;
+                    out->else_branch = $3;
+                    $$ = out;
+            }
+        ;
+
 while_stmt
     : WHILE_KW expr block
       {
@@ -493,7 +594,16 @@ for_stmt
     : FOR '(' opt_expr ';' opt_expr ';' opt_expr ')' block
       {
           $$ = make_for_stmt($3, $5, $7, $9, line_no);
-      }
+            }
+        | FOR '(' type IDENT ASSIGN expr ';' opt_expr ';' opt_expr ')' block
+            {
+                Stmt *loop = make_for_stmt(NULL, $8, $10, $12, line_no);
+                loop->u.for_stmt.has_init_decl = 1;
+                loop->u.for_stmt.init_decl_type = type_from_string($3);
+                loop->u.for_stmt.init_decl_name = $4;
+                loop->u.for_stmt.init_decl_value = $6;
+                $$ = loop;
+            }
     ;
 
 param_list_opt
@@ -578,6 +688,11 @@ expr
             {
                     $$ = make_expr_index($1, $3, line_no);
             }
+    | IDENT ASSIGN expr
+      {
+          Expr *lhs = make_expr_ident($1, line_no);
+          $$ = make_expr_binary(strdup("="), lhs, $3, line_no);
+      }
     | NUMBER
       {
           $$ = make_expr_number($1, line_no);
@@ -959,6 +1074,18 @@ static Stmt *make_for_stmt(Expr *init, Expr *cond, Expr *post, Stmt *body, int l
     stmt->u.for_stmt.cond = cond;
     stmt->u.for_stmt.post = post;
     stmt->u.for_stmt.body = body;
+    stmt->u.for_stmt.has_init_decl = 0;
+    stmt->u.for_stmt.init_decl_type = T_UNKNOWN;
+    stmt->u.for_stmt.init_decl_name = NULL;
+    stmt->u.for_stmt.init_decl_value = NULL;
+    return stmt;
+}
+
+static Stmt *make_switch_stmt(Expr *expr, Branch *cases, Stmt *default_branch, int line) {
+    Stmt *stmt = stmt_new(STMT_SWITCH, line);
+    stmt->u.switch_stmt.expr = expr;
+    stmt->u.switch_stmt.cases = cases;
+    stmt->u.switch_stmt.default_branch = default_branch;
     return stmt;
 }
 
@@ -1245,6 +1372,25 @@ static TypeKind infer_expr(Expr *expr) {
                 expr->inferred = T_INT;
                 break;
             }
+            /* Built-in math-like helpers from the custom language */
+            if (strcmp(expr->text, "raise_to") == 0 ||
+                strcmp(expr->text, "square_root") == 0 ||
+                strcmp(expr->text, "magnitude") == 0 ||
+                strcmp(expr->text, "round_down") == 0 ||
+                strcmp(expr->text, "round_up") == 0 ||
+                strcmp(expr->text, "ln") == 0 ||
+                strcmp(expr->text, "SIN") == 0 ||
+                strcmp(expr->text, "COS") == 0 ||
+                strcmp(expr->text, "TAN") == 0) {
+                /* Treat these as int-returning numeric helpers to match 'num' variables. */
+                ExprList *arg = expr->args;
+                while (arg) {
+                    infer_expr(arg->expr);
+                    arg = arg->next;
+                }
+                expr->inferred = T_INT;
+                break;
+            }
             Function *fn = find_function(expr->text);
             if (!fn) {
                 semantic_error(expr->line, "call to undefined function '%s'", expr->text);
@@ -1303,6 +1449,13 @@ static TypeKind infer_expr(Expr *expr) {
                     expr->inferred = T_ERROR;
                 } else {
                     expr->inferred = T_BOOL;
+                }
+            } else if (!strcmp(expr->op, "=")) {
+                if (!type_compatible(left, right)) {
+                    semantic_error(expr->line, "assignment requires compatible types");
+                    expr->inferred = T_ERROR;
+                } else {
+                    expr->inferred = left;
                 }
             } else {
                 expr->inferred = T_ERROR;
@@ -1498,7 +1651,25 @@ static void analyze_stmt(Stmt *stmt) {
             break;
         }
         case STMT_FOR: {
-            if (stmt->u.for_stmt.init) infer_expr(stmt->u.for_stmt.init);
+            push_scope();
+            if (stmt->u.for_stmt.has_init_decl) {
+                if (stmt->u.for_stmt.init_decl_type == T_VOID) {
+                    semantic_error(stmt->line, "variable '%s' cannot have type void", stmt->u.for_stmt.init_decl_name);
+                }
+                if (stmt->u.for_stmt.init_decl_value) {
+                    TypeKind init_type = infer_expr(stmt->u.for_stmt.init_decl_value);
+                    if (!type_compatible(stmt->u.for_stmt.init_decl_type, init_type)) {
+                        semantic_error(stmt->line,
+                                       "cannot initialize '%s' of type %s with %s",
+                                       stmt->u.for_stmt.init_decl_name,
+                                       type_name(stmt->u.for_stmt.init_decl_type),
+                                       type_name(init_type));
+                    }
+                }
+                scope_add_symbol(stmt->u.for_stmt.init_decl_name, stmt->u.for_stmt.init_decl_type, stmt->line);
+            } else if (stmt->u.for_stmt.init) {
+                infer_expr(stmt->u.for_stmt.init);
+            }
             if (stmt->u.for_stmt.cond) {
                 TypeKind cond_type = infer_expr(stmt->u.for_stmt.cond);
                 if (!is_bool_like(cond_type)) {
@@ -1506,9 +1677,29 @@ static void analyze_stmt(Stmt *stmt) {
                 }
             }
             if (stmt->u.for_stmt.post) infer_expr(stmt->u.for_stmt.post);
-            push_scope();
             analyze_stmt_list(stmt->u.for_stmt.body);
             pop_scope();
+            break;
+        }
+        case STMT_SWITCH: {
+            TypeKind cond_type = infer_expr(stmt->u.switch_stmt.expr);
+            if (!is_integral(cond_type)) {
+                semantic_error(stmt->line, "switch expression must be integral");
+            }
+            for (Branch *br = stmt->u.switch_stmt.cases; br; br = br->next) {
+                TypeKind case_type = infer_expr(br->cond);
+                if (!type_compatible(cond_type, case_type)) {
+                    semantic_error(br->line, "case label type must match switch expression type");
+                }
+                push_scope();
+                analyze_stmt_list(br->body);
+                pop_scope();
+            }
+            if (stmt->u.switch_stmt.default_branch) {
+                push_scope();
+                analyze_stmt_list(stmt->u.switch_stmt.default_branch);
+                pop_scope();
+            }
             break;
         }
         case STMT_BREAK:
@@ -1564,8 +1755,37 @@ static void emit_indent(FILE *f) {
     }
 }
 
-static void emit_expr(FILE *f, Expr *expr) {
+static int expr_precedence(Expr *expr) {
+    if (!expr) return 0;
+
+    switch (expr->kind) {
+        case EXPR_IDENT:
+        case EXPR_NUMBER:
+        case EXPR_STRING:
+        case EXPR_CALL:
+        case EXPR_INDEX:
+            return 100;
+        case EXPR_UNARY:
+            return 90;
+        case EXPR_BINARY:
+            if (!strcmp(expr->op, "=")) return 10;
+            if (!strcmp(expr->op, "||")) return 20;
+            if (!strcmp(expr->op, "&&")) return 30;
+            if (!strcmp(expr->op, "==") || !strcmp(expr->op, "!=")) return 40;
+            if (!strcmp(expr->op, "<") || !strcmp(expr->op, ">") || !strcmp(expr->op, "<=") || !strcmp(expr->op, ">=")) return 50;
+            if (!strcmp(expr->op, "+") || !strcmp(expr->op, "-")) return 60;
+            if (!strcmp(expr->op, "*") || !strcmp(expr->op, "/") || !strcmp(expr->op, "%")) return 70;
+            return 50;
+    }
+    return 0;
+}
+
+static void emit_expr_prec(FILE *f, Expr *expr, int parent_prec) {
     if (!expr) return;
+
+    int prec = expr_precedence(expr);
+    int need_parens = prec < parent_prec;
+    if (need_parens) fputc('(', f);
 
     switch (expr->kind) {
         case EXPR_IDENT:
@@ -1578,19 +1798,29 @@ static void emit_expr(FILE *f, Expr *expr) {
                 ExprList *first = expr->args;
                 ExprList *second = first ? first->next : NULL;
                 fprintf(f, "binary_search(");
-                emit_expr(f, first ? first->expr : NULL);
+                emit_expr_prec(f, first ? first->expr : NULL, 0);
                 if (expr->array_size > 0) {
                     fprintf(f, ", %d, ", expr->array_size);
                 } else {
                     fputs(", 0, ", f);
                 }
-                emit_expr(f, second ? second->expr : NULL);
+                emit_expr_prec(f, second ? second->expr : NULL, 0);
                 fputc(')', f);
                 break;
             }
-            fprintf(f, "%s(", expr->text);
+            const char *fname = expr->text;
+            if (strcmp(fname, "raise_to") == 0) fname = "pow";
+            else if (strcmp(fname, "square_root") == 0) fname = "sqrt";
+            else if (strcmp(fname, "magnitude") == 0) fname = "abs";
+            else if (strcmp(fname, "round_down") == 0) fname = "floor";
+            else if (strcmp(fname, "round_up") == 0) fname = "ceil";
+            else if (strcmp(fname, "ln") == 0) fname = "logf";
+            else if (strcmp(fname, "SIN") == 0) fname = "sinf";
+            else if (strcmp(fname, "COS") == 0) fname = "cosf";
+            else if (strcmp(fname, "TAN") == 0) fname = "tanf";
+            fprintf(f, "%s(", fname);
             for (ExprList *arg = expr->args; arg; arg = arg->next) {
-                emit_expr(f, arg->expr);
+                emit_expr_prec(f, arg->expr, 0);
                 if (arg->next) fputs(", ", f);
             }
             fputc(')', f);
@@ -1598,27 +1828,40 @@ static void emit_expr(FILE *f, Expr *expr) {
         }
         case EXPR_INDEX:
             fprintf(f, "%s[", expr->text);
-            emit_expr(f, expr->index);
+            emit_expr_prec(f, expr->index, 0);
             fputc(']', f);
             break;
-        case EXPR_BINARY:
-            fputc('(', f);
-            emit_expr(f, expr->left);
+        case EXPR_BINARY: {
+            int child_prec = prec;
+            emit_expr_prec(f, expr->left, child_prec);
             fprintf(f, " %s ", expr->op);
-            emit_expr(f, expr->right);
-            fputc(')', f);
+            emit_expr_prec(f, expr->right, child_prec);
             break;
+        }
         case EXPR_UNARY:
             fprintf(f, "%s", expr->op);
-            emit_expr(f, expr->left);
+            emit_expr_prec(f, expr->left, prec);
             break;
     }
+
+    if (need_parens) fputc(')', f);
+}
+
+static void emit_expr(FILE *f, Expr *expr) {
+    emit_expr_prec(f, expr, 0);
 }
 
 static void emit_stmt_list(FILE *f, Stmt *stmt) {
     for (Stmt *it = stmt; it; it = it->next) {
         emit_stmt(f, it);
     }
+}
+
+static int stmt_list_needs_switch_break(Stmt *stmt) {
+    if (!stmt) return 1;
+    Stmt *last = stmt;
+    while (last->next) last = last->next;
+    return last->kind != STMT_BREAK && last->kind != STMT_RETURN;
 }
 
 static void emit_stmt(FILE *f, Stmt *stmt) {
@@ -1734,7 +1977,15 @@ static void emit_stmt(FILE *f, Stmt *stmt) {
         case STMT_FOR:
             emit_indent(f);
             fputs("for (", f);
-            if (stmt->u.for_stmt.init) emit_expr(f, stmt->u.for_stmt.init);
+            if (stmt->u.for_stmt.has_init_decl) {
+                fprintf(f, "%s %s", type_name(stmt->u.for_stmt.init_decl_type), stmt->u.for_stmt.init_decl_name);
+                if (stmt->u.for_stmt.init_decl_value) {
+                    fputs(" = ", f);
+                    emit_expr(f, stmt->u.for_stmt.init_decl_value);
+                }
+            } else if (stmt->u.for_stmt.init) {
+                emit_expr(f, stmt->u.for_stmt.init);
+            }
             fputs("; ", f);
             if (stmt->u.for_stmt.cond) emit_expr(f, stmt->u.for_stmt.cond);
             fputs("; ", f);
@@ -1742,6 +1993,40 @@ static void emit_stmt(FILE *f, Stmt *stmt) {
             fputs(") {\n", f);
             indent_level++;
             emit_stmt_list(f, stmt->u.for_stmt.body);
+            indent_level--;
+            emit_indent(f);
+            fputs("}\n", f);
+            break;
+        case STMT_SWITCH:
+            emit_indent(f);
+            fputs("switch (", f);
+            emit_expr(f, stmt->u.switch_stmt.expr);
+            fputs(") {\n", f);
+            indent_level++;
+            for (Branch *br = stmt->u.switch_stmt.cases; br; br = br->next) {
+                emit_indent(f);
+                fputs("case ", f);
+                emit_expr(f, br->cond);
+                fputs(":\n", f);
+                indent_level++;
+                emit_stmt_list(f, br->body);
+                if (stmt_list_needs_switch_break(br->body)) {
+                    emit_indent(f);
+                    fputs("break;\n", f);
+                }
+                indent_level--;
+            }
+            if (stmt->u.switch_stmt.default_branch) {
+                emit_indent(f);
+                fputs("default:\n", f);
+                indent_level++;
+                emit_stmt_list(f, stmt->u.switch_stmt.default_branch);
+                if (stmt_list_needs_switch_break(stmt->u.switch_stmt.default_branch)) {
+                    emit_indent(f);
+                    fputs("break;\n", f);
+                }
+                indent_level--;
+            }
             indent_level--;
             emit_indent(f);
             fputs("}\n", f);
@@ -1791,6 +2076,7 @@ static void emit_program(const char *path) {
 
     emit_include(outf, "<stdio.h>");
     emit_include(outf, "<math.h>");
+    emit_include(outf, "<stdlib.h>");
     emit_include(outf, "<stdbool.h>");
     emit_binary_search_helper(outf);
     for (Include *inc = g_includes; inc; inc = inc->next) {
